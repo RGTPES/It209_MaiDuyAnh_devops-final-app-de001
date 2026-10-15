@@ -19,3 +19,6 @@ Thumbs.db
 id_*
 deploy_key
 deploy_key.pub
+
+# Local database credentials; CI creates its own student.env.
+/student.env

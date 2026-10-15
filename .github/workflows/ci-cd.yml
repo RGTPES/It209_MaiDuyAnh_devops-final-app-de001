@@ -3,7 +3,7 @@
 #  - Các bước không có TODO: ĐÃ VIẾT SẴN, không cần sửa.
 #  - Sinh viên điền các ô ______ tại các dòng TODO.
 #  - job build : kiểm tra student.env -> build & chạy thử -> smoke test -> push image GHCR
-#  - job deploy: SSH vào server -> cập nhật mã nguồn -> pull image -> khởi động lại
+#  - job deploy: giữ cấu hình SSH nhưng TẮT theo phạm vi bài; không triển khai lên VPS.
 # =============================================================================
 name: CI/CD
 
@@ -28,9 +28,31 @@ jobs:
       - name: Checkout mã nguồn
         uses: actions/checkout@v4
 
+      - name: Tạo student.env riêng cho CI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import secrets
+
+          content = Path("student.env.example").read_text(encoding="utf-8")
+          for name in ("MYSQL_PASSWORD", "MYSQL_ROOT_PASSWORD"):
+              value = secrets.token_hex(32)
+              print(f"::add-mask::{value}")
+              content, count = re.subn(
+                  rf'^{name}=".*"$', f'{name}="{value}"', content, flags=re.MULTILINE
+              )
+              if count != 1:
+                  raise SystemExit(f"Expected one {name} in student.env.example")
+          Path("student.env").write_text(content, encoding="utf-8")
+          PY
+
       - name: Kiểm tra thông tin trong student.env
         run: |
           set -a; source student.env; set +a
+          for v in MYSQL_PASSWORD MYSQL_ROOT_PASSWORD; do
+            printf '::add-mask::%s\n' "${!v}"
+          done
           for v in STUDENT_NAME STUDENT_ID STUDENT_CLASS STUDENT_EMAIL GITHUB_USERNAME \
                    APP_PORT COMPOSE_PROJECT_NAME MYSQL_USER MYSQL_PASSWORD MYSQL_ROOT_PASSWORD; do
             if [ -z "${!v}" ]; then
@@ -38,10 +60,23 @@ jobs:
               exit 1
             fi
           done
-          if [ "$APP_PORT" -lt 8080 ]; then
-            echo "::error file=student.env::APP_PORT phải từ 8080 trở lên"
+          if ! [[ "$APP_PORT" =~ ^[0-9]+$ ]] || [ "$APP_PORT" -lt 8080 ] || [ "$APP_PORT" -gt 65535 ]; then
+            echo "::error file=student.env::APP_PORT phải là số từ 8080 đến 65535"
             exit 1
           fi
+          if [ "$MYSQL_USER" = root ]; then
+            echo "::error file=student.env::MYSQL_USER phải là tài khoản ứng dụng, không dùng root"
+            exit 1
+          fi
+          if [ "$EXAM_CODE" != 001 ] || [ "$MYSQL_DATABASE" != ptit_lab_db ]; then
+            echo "::error file=student.env::Không thay đổi EXAM_CODE hoặc MYSQL_DATABASE"
+            exit 1
+          fi
+          if ! [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*-de001$ ]]; then
+            echo "::error file=student.env::COMPOSE_PROJECT_NAME phải viết thường và kết thúc bằng -de001"
+            exit 1
+          fi
+          docker compose --env-file student.env config --quiet
           echo "### Sinh viên: $STUDENT_NAME - $STUDENT_ID - $STUDENT_CLASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Đặt tên image
@@ -57,13 +92,47 @@ jobs:
         #         chờ các service sẵn sàng (gợi ý: --wait --wait-timeout 300)
         run: docker compose --env-file student.env up -d --build --wait --wait-timeout 300
 
+      - name: Kiểm tra runtime JRE 21 và user thường
+        run: |
+          docker compose --env-file student.env ps
+          docker compose --env-file student.env exec -T app sh -ec '
+            id
+            test "$(id -u)" -ne 0
+            java -version
+            test -z "$(command -v javac)"
+          '
+
       - name: Smoke test
+        env:
+          EXPECTED_VERSION: ${{ github.sha }}
         run: |
           set -a; source student.env; set +a
           BASE="http://localhost:${APP_PORT}"
-          # Kiểm tra endpoint $BASE/api/labs trả về JSON (CÓ SẴN, lỗi -> pipeline FAIL)
-          curl -fsS --retry 12 --retry-delay 5 --retry-all-errors "$BASE/api/labs" | grep -q '"id"'
-          echo "Smoke test OK"
+          curl -fsS --max-time 10 --retry 12 --retry-delay 5 --retry-all-errors \
+            --dump-header "$RUNNER_TEMP/labs-headers.txt" \
+            --output "$RUNNER_TEMP/labs.json" "$BASE/api/labs"
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+
+          folder = Path(os.environ["RUNNER_TEMP"])
+          labs = json.loads((folder / "labs.json").read_text(encoding="utf-8"))
+          assert isinstance(labs, list) and len(labs) == 8, "Expected 8 initialized labs"
+          fields = {"id", "labName", "building", "capacity", "equipment", "status"}
+          assert all(isinstance(lab, dict) and fields <= lab.keys() for lab in labs)
+          ids = [lab["id"] for lab in labs]
+          assert ids == sorted(ids) and len(set(ids)) == 8
+          assert all(isinstance(lab["capacity"], int) and lab["capacity"] > 0 for lab in labs)
+          headers = dict(
+              line.split(":", 1) for line in (folder / "labs-headers.txt").read_text().splitlines()
+              if ":" in line
+          )
+          headers = {key.lower(): value.strip() for key, value in headers.items()}
+          assert "application/json" in headers.get("content-type", "")
+          assert headers.get("x-app-version") == os.environ["EXPECTED_VERSION"]
+          print("Smoke test passed: 8 labs from MySQL, JSON schema and image version verified")
+          PY
 
       - name: In log khi lỗi
         if: failure()
@@ -85,13 +154,17 @@ jobs:
           docker push "$IMAGE:${{ github.sha }}"
           docker tag "$IMAGE:${{ github.sha }}" "$IMAGE:latest"
           docker push "$IMAGE:latest"
+          docker manifest inspect "$IMAGE:${{ github.sha }}" > /dev/null
+          docker manifest inspect "$IMAGE:latest" > /dev/null
 
       - name: Dọn dẹp
         if: always()
         run: docker compose --env-file student.env down -v
 
   deploy:
-    name: Deploy lên server
+    name: Deploy lên server (đã tắt)
+    # Không triển khai thực tế, kể cả khi push main hoặc chạy workflow_dispatch.
+    if: ${{ false }}
     # TODO 4: chỉ chạy khi job build thành công
     needs: build
     runs-on: ubuntu-latest
@@ -109,7 +182,7 @@ jobs:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
           DEPLOY_DIR: ${{ github.event.repository.name }}
         with:
-          # TODO 5: kết nối bằng các GitHub Secrets SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
+          # TODO 6: kết nối bằng các GitHub Secrets SERVER_HOST, SERVER_USER, SERVER_SSH_KEY
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
@@ -124,7 +197,7 @@ jobs:
             git reset --hard origin/main
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             export APP_IMAGE APP_TAG
-            # TODO 6: kéo image mới của service app về, rồi khởi động lại hệ thống
+            # TODO 7: kéo image mới của service app về, rồi khởi động lại hệ thống
             #         KHÔNG build trên server (gợi ý: pull app, up -d --no-build)
             docker compose --env-file student.env pull app
             docker compose --env-file student.env up -d --no-build --wait --wait-timeout 300

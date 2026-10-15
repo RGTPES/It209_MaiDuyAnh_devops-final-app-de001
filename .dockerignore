@@ -17,8 +17,12 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 student.env
+student.env.example
+deploy_key
+deploy_key.pub
 nginx/
 database/
 screenshots/
+anh-minh-chung/
 submission-content/
 *.md
